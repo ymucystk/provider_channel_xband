@@ -131,9 +131,6 @@ type Movesbase struct {
 	MeshId    string      `json:"meshId"`
 	Operation []Operation `json:"operation"`
 }
-type JsonFile struct {
-	Movesbase []Movesbase `json:"movesbase"`
-}
 
 const unit_lat = 2.0 / (3.0 * 8.0 * 40.0) // 緯度２度あたり960個のセル
 const unit_lon = 1.0 / (8.0 * 40.0)       // 経度１度あたり320個のセル？
@@ -181,7 +178,64 @@ func pallet(rainfall float64) [3]int {
 		int(float64(sourceColor[2]) + (rate * float64(targetColor[2]-sourceColor[2])))}
 }
 
-func conversionXbandJson() ([]Movesbase, error) {
+func conversionXbandJson(dfile string) (string, Operation, bool) {
+
+	var dataheader DataHeader
+	var blockHeader BlockHeader
+	var blockData BlockData
+
+	log.Printf("fileName %s", dfile)
+
+	fp, err := os.Open(dfile)
+	if err != nil {
+		return "", Operation{}, false
+	}
+	defer fp.Close()
+	gr, err := gzip.NewReader(fp)
+	if err != nil {
+		return "", Operation{}, false
+	}
+	defer gr.Close()
+
+	binary.Read(gr, binary.BigEndian, &dataheader)
+	log.Printf("DataHeader %x", dataheader)
+	var yaer, month, date, hour, minute int
+	fmt.Sscanf(fmt.Sprintf("%s", dataheader.DateTime), "%4d.%2d.%2d.%2d.%2d", &yaer, &month, &date, &hour, &minute)
+	elapsedtime := time.Date(yaer, time.Month(month), date, hour, minute, 0, 0, time.Local).Unix()
+	log.Printf("elapsedtime %d", elapsedtime)
+	gridcelldata := make([]Gridcelldata, 0)
+	firstmeshID := fmt.Sprintf("%04x", dataheader.DataID4)
+	log.Printf("firstmeshID %s", firstmeshID)
+
+	for i := 0; i < int(dataheader.BlockCount); i++ {
+		binary.Read(gr, binary.BigEndian, &blockHeader)
+		base_lat := float64(blockHeader.Base_lat) / 1.5
+		base_lon := float64(blockHeader.Base_lon) + 100
+		mash2_lat := blockHeader.Mash2 >> 4
+		mash2_lon := blockHeader.Mash2 & 0b1111
+		//log.Printf("%f %f %d %d %d", base_lat, base_lon, mash2_lat, mash2_lon, blockHeader.Cell_max)
+		for j := 0; j < int(blockHeader.Cell_max); j++ {
+			binary.Read(gr, binary.BigEndian, &blockData)
+			for k := 0; k < len(blockData.Cell); k++ {
+				for l := 0; l < len(blockData.Cell[k]); l++ {
+					if blockData.Cell[k][l]&0b1000000000000000 != 0 {
+						cell_lat := base_lat + ((((float64(mash2_lat) + 1.0) * 40.0) - float64(k)) * unit_lat)        //4分の1 3次メッシュ 北端
+						cell_lon := base_lon + ((((float64(mash2_lon) + float64(j)) * 40.0) + float64(l)) * unit_lon) //4分の1 3次メッシュ 西端
+						rainfall := float64(blockData.Cell[k][l]&0b0000111111111111) / 10
+						if rainfall > 0 {
+							gridcelldata = append(gridcelldata, Gridcelldata{Position: [2]float64{cell_lon, cell_lat},
+								Color: pallet(rainfall), Elevation: rainfall})
+							//log.Printf("%f %f %f", cell_lat, cell_lon, rainfall)
+						}
+					}
+				}
+			}
+		}
+	}
+	return firstmeshID, Operation{Elapsedtime: elapsedtime, Gridcelldata: gridcelldata}, true
+}
+
+func conversionAllXbandJson() ([]Movesbase, bool) {
 	now := time.Now()
 
 	stMonth, stDate := getMonthDate(*startDate)
@@ -227,74 +281,28 @@ func conversionXbandJson() ([]Movesbase, error) {
 
 	fileNames.Sort()
 
-	var dataheader DataHeader
-	var blockHeader BlockHeader
-	var blockData BlockData
 	meshDatabase := map[string][]Operation{}
 
 	for _, fileName := range fileNames {
+
 		dfile := path.Join(*dir, fileName)
 
-		log.Printf("fileName %s", dfile)
-
-		fp, err := os.Open(dfile)
-		if err != nil {
-			return nil, err
-		}
-		defer fp.Close()
-		gr, err := gzip.NewReader(fp)
-		if err != nil {
-			return nil, err
-		}
-		defer gr.Close()
-
-		binary.Read(gr, binary.BigEndian, &dataheader)
-		log.Printf("DataHeader %x", dataheader)
-		var yaer, month, date, hour, minute int
-		fmt.Sscanf(fmt.Sprintf("%s", dataheader.DateTime), "%4d.%2d.%2d.%2d.%2d", &yaer, &month, &date, &hour, &minute)
-		elapsedtime := time.Date(yaer, time.Month(month), date, hour, minute, 0, 0, time.Local).Unix()
-		log.Printf("elapsedtime %d", elapsedtime)
-		gridcelldata := make([]Gridcelldata, 0)
-		firstmeshID := fmt.Sprintf("%04x", dataheader.DataID4)
-		log.Printf("firstmeshID %s", firstmeshID)
-
-		for i := 0; i < int(dataheader.BlockCount); i++ {
-			binary.Read(gr, binary.BigEndian, &blockHeader)
-			base_lat := float64(blockHeader.Base_lat) / 1.5
-			base_lon := float64(blockHeader.Base_lon) + 100
-			mash2_lat := blockHeader.Mash2 >> 4
-			mash2_lon := blockHeader.Mash2 & 0b1111
-			//log.Printf("%f %f %d %d %d", base_lat, base_lon, mash2_lat, mash2_lon, blockHeader.Cell_max)
-			for j := 0; j < int(blockHeader.Cell_max); j++ {
-				binary.Read(gr, binary.BigEndian, &blockData)
-				for k := 0; k < len(blockData.Cell); k++ {
-					for l := 0; l < len(blockData.Cell[k]); l++ {
-						if blockData.Cell[k][l]&0b1000000000000000 != 0 {
-							cell_lat := base_lat + ((((float64(mash2_lat) + 1.0) * 40.0) - float64(k)) * unit_lat)        //4分の1 3次メッシュ 北端
-							cell_lon := base_lon + ((((float64(mash2_lon) + float64(j)) * 40.0) + float64(l)) * unit_lon) //4分の1 3次メッシュ 西端
-							rainfall := float64(blockData.Cell[k][l]&0b0000111111111111) / 10
-							if rainfall > 0 {
-								gridcelldata = append(gridcelldata, Gridcelldata{Position: [2]float64{cell_lon, cell_lat},
-									Color: pallet(rainfall), Elevation: rainfall})
-								//log.Printf("%f %f %f", cell_lat, cell_lon, rainfall)
-							}
-						}
-					}
-				}
-			}
+		firstmeshID, addoperation, result := conversionXbandJson(dfile)
+		if !result {
+			return []Movesbase{}, result
 		}
 		operation, ok := meshDatabase[firstmeshID]
 		if !ok {
 			operation = make([]Operation, 0)
 		}
-		operation = append(operation, Operation{Elapsedtime: elapsedtime, Gridcelldata: gridcelldata})
+		operation = append(operation, addoperation)
 		meshDatabase[firstmeshID] = operation
 	}
 	movesbase := make([]Movesbase, 0)
 	for meshId, operation := range meshDatabase {
 		movesbase = append(movesbase, Movesbase{MeshId: meshId, Operation: operation})
 	}
-	return movesbase, nil
+	return movesbase, true
 }
 
 // sending People Counter File.
@@ -439,8 +447,8 @@ func sendingStoredFile(clients map[uint32]*sxutil.SXServiceClient) {
 
 func sendAllStoredFile(clients map[uint32]*sxutil.SXServiceClient) {
 	// check all files in dir.
-	movesbase, err := conversionXbandJson()
-	if err != nil {
+	movesbase, result := conversionAllXbandJson()
+	if !result {
 		os.Exit(1)
 	}
 	//jsonFile := map[string][]Movesbase{"movesbase":movesbase}
