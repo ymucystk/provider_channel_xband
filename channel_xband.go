@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,20 +31,23 @@ type DataStore interface {
 }
 
 var (
-	nodesrv   = flag.String("nodesrv", "127.0.0.1:9990", "Node ID Server")
-	channel   = flag.String("channel", "3", "Retrieving channel type(default 3, support comma separated)")
-	local     = flag.String("local", "", "Specify Local Synerex Server")
-	startDate = flag.String("startDate", "01-01", "Specify Start Date")
-	endDate   = flag.String("endDate", "12-31", "Specify End Date")
-	startTime = flag.String("startTime", "00:00", "Specify Start Time")
-	endTime   = flag.String("endTime", "24:00", "Specify End Time")
-	dir       = flag.String("dir", "xbanddata", "Directory of data storage") // for all file
-	all       = flag.Bool("all", true, "Send all file in data storage")      // for all file
-	verbose   = flag.Bool("verbose", false, "Verbose information")
-	jst       = flag.Bool("jst", false, "Run/display with JST Time")
-	recTime   = flag.Bool("recTime", false, "Send with recorded time")
-	speed     = flag.Float64("speed", 1.0, "Speed of sending packets(default real time =1.0), minus in msec")
-	skip      = flag.Int("skip", 0, "Skip lines(default 0)")
+	nodesrv     = flag.String("nodesrv", "127.0.0.1:9990", "Node ID Server")
+	channel     = flag.String("channel", "3", "Retrieving channel type(default 3, support comma separated)")
+	local       = flag.String("local", "", "Specify Local Synerex Server")
+	startDate   = flag.String("startDate", "01-01", "Specify Start Date")
+	endDate     = flag.String("endDate", "12-31", "Specify End Date")
+	startTime   = flag.String("startTime", "00:00", "Specify Start Time")
+	endTime     = flag.String("endTime", "24:00", "Specify End Time")
+	dir         = flag.String("dir", "xbanddata", "Directory of data storage") // for all file
+	all         = flag.Bool("all", true, "Send all file in data storage")      // for all file
+	completion  = flag.Bool("completion", false, "Completing data between xband data")
+	miniGapTime = flag.Int("miniGapTime", 60, "Minimum time difference. (seconds)") // for completion true
+	compdiv     = flag.Int("compdiv", 6, "Number of splits.")                       // for completion true
+	verbose     = flag.Bool("verbose", false, "Verbose information")
+	jst         = flag.Bool("jst", false, "Run/display with JST Time")
+	recTime     = flag.Bool("recTime", false, "Send with recorded time")
+	speed       = flag.Float64("speed", 1.0, "Speed of sending packets(default real time =1.0), minus in msec")
+	skip        = flag.Int("skip", 0, "Skip lines(default 0)")
 )
 
 var sendfile string
@@ -124,8 +128,8 @@ type Gridcelldata struct {
 	Elevation float64    `json:"elevation"`
 }
 type Operation struct {
-	Elapsedtime  int64          `json:"elapsedtime"`
-	Gridcelldata []Gridcelldata `json:"gridcelldata"`
+	Elapsedtime  int           `json:"elapsedtime"`
+	Gridcelldata []interface{} `json:"gridcelldata"`
 }
 type Movesbase struct {
 	MeshId    string      `json:"meshId"`
@@ -201,11 +205,12 @@ func conversionXbandJson(dfile string) (string, Operation, bool) {
 	log.Printf("DataHeader %x", dataheader)
 	var yaer, month, date, hour, minute int
 	fmt.Sscanf(fmt.Sprintf("%s", dataheader.DateTime), "%4d.%2d.%2d.%2d.%2d", &yaer, &month, &date, &hour, &minute)
-	elapsedtime := time.Date(yaer, time.Month(month), date, hour, minute, 0, 0, time.Local).Unix()
+	elapsedtime := int(time.Date(yaer, time.Month(month), date, hour, minute, 0, 0, time.Local).Unix())
 	log.Printf("elapsedtime %d", elapsedtime)
-	gridcelldata := make([]Gridcelldata, 0)
+	gridcelldata := make([]interface{}, 0)
 	firstmeshID := fmt.Sprintf("%04x", dataheader.DataID4)
 	log.Printf("firstmeshID %s", firstmeshID)
+	emptyData := make(map[string]interface{})
 
 	for i := 0; i < int(dataheader.BlockCount); i++ {
 		binary.Read(gr, binary.BigEndian, &blockHeader)
@@ -226,6 +231,8 @@ func conversionXbandJson(dfile string) (string, Operation, bool) {
 							gridcelldata = append(gridcelldata, Gridcelldata{Position: [2]float64{cell_lon, cell_lat},
 								Color: pallet(rainfall), Elevation: rainfall})
 							//log.Printf("%f %f %f", cell_lat, cell_lon, rainfall)
+						} else {
+							gridcelldata = append(gridcelldata, emptyData)
 						}
 					}
 				}
@@ -287,7 +294,7 @@ func conversionAllXbandJson() ([]Movesbase, bool) {
 
 		dfile := path.Join(*dir, fileName)
 
-		firstmeshID, addoperation, result := conversionXbandJson(dfile)
+		firstmeshID, addOperation, result := conversionXbandJson(dfile)
 		if !result {
 			return []Movesbase{}, result
 		}
@@ -295,7 +302,10 @@ func conversionAllXbandJson() ([]Movesbase, bool) {
 		if !ok {
 			operation = make([]Operation, 0)
 		}
-		operation = append(operation, addoperation)
+		if *completion {
+			operation = elapsedDataGeneration(operation, addOperation)
+		}
+		operation = append(operation, addOperation)
 		meshDatabase[firstmeshID] = operation
 	}
 	movesbase := make([]Movesbase, 0)
@@ -305,144 +315,73 @@ func conversionAllXbandJson() ([]Movesbase, bool) {
 	return movesbase, true
 }
 
-// sending People Counter File.
-func sendingStoredFile(clients map[uint32]*sxutil.SXServiceClient) {
-	// file
-	/*
-		scanner := bufio.NewScanner(fp) // csv reader
-		var buf []byte = make([]byte, 1024)
-		scanner.Buffer(buf, 1024*1024*64) // 64Mbytes buffer
-
-		last := time.Now()
-		started := false // start flag
-		stHour, stMin := getHourMin(*startTime)
-		edHour, edMin := getHourMin(*endTime)
-		skipCount := 0
-
-		if *verbose {
-			log.Printf("Verbose output for file %s", *sendfile)
-			log.Printf("StartTime %02d:%02d  -- %02d:%02d", stHour, stMin, edHour, edMin)
-		}
-		jstZone := time.FixedZone("Asia/Tokyo", 9*60*60)
-
-		for scanner.Scan() { // read one line.
-			if *skip != 0 { // if there is skip  , do it first
-				skipCount++
-				if skipCount < *skip {
-					continue
-				}
-				log.Printf("Skip %d:", *skip)
-				skipCount = 0
-			}
-
-			dt := scanner.Text()
-			//		if *verbose {
-			//			log.Printf("Scan:%s", dt)
-			//		}
-
-			token := strings.Split(dt, ",")
-			outx := 0
-
-			if strings.HasPrefix(token[6], "\"") {
-				// token[6] = argJson has comma data..
-				token[6] = token[6][1:]
-				lastToken := ""
-				ix := 6
-				for {
-					if strings.HasSuffix(token[ix], "\"") {
-						lastToken += token[ix][:len(token[ix])-1]
-						break
-					} else {
-						lastToken += token[ix] + ","
-						ix++
+func elapsedDataGeneration(operation []Operation, addOperation Operation) []Operation {
+	operationLength := len(operation)
+	minimumGapTime := *miniGapTime
+	divisions := *compdiv
+	if operationLength > 0 {
+		beforeElapsedtime := operation[operationLength-1].Elapsedtime
+		afterElapsedtime := addOperation.Elapsedtime
+		if (afterElapsedtime - beforeElapsedtime) >= minimumGapTime {
+			beforeGridcelldata := operation[operationLength-1].Gridcelldata
+			afterGridcelldata := addOperation.Gridcelldata
+			if len(beforeGridcelldata) == len(afterGridcelldata) {
+				gapTime := int((afterElapsedtime - beforeElapsedtime) / divisions)
+				generateNum := int((afterElapsedtime - beforeElapsedtime) / gapTime)
+				for i := 0; i < int(generateNum); i++ {
+					gridcelldata := make([]interface{}, 0)
+					for dataidx, beforedata := range beforeGridcelldata {
+						afterdata := afterGridcelldata[dataidx]
+						if fmt.Sprintf("%v", reflect.TypeOf(beforedata)) == "main.Gridcelldata" &&
+							fmt.Sprintf("%v", reflect.TypeOf(afterdata)) == "main.Gridcelldata" {
+							rainfall := beforedata.(Gridcelldata).Elevation
+							afterRainfall := afterdata.(Gridcelldata).Elevation
+							if rainfall != afterRainfall {
+								values := (math.Abs(rainfall-afterRainfall) * (float64(i+1) / float64(generateNum)))
+								if rainfall > afterRainfall {
+									rainfall = rainfall - values
+								} else {
+									rainfall = rainfall + values
+								}
+							}
+							if rainfall >= 0.1 {
+								gridcelldata = append(gridcelldata, Gridcelldata{Position: beforedata.(Gridcelldata).Position,
+									Color: pallet(rainfall), Elevation: rainfall})
+							}
+						} else if fmt.Sprintf("%v", reflect.TypeOf(beforedata)) != "main.Gridcelldata" &&
+							fmt.Sprintf("%v", reflect.TypeOf(afterdata)) == "main.Gridcelldata" {
+							rainfall := float64(0)
+							afterRainfall := afterdata.(Gridcelldata).Elevation
+							if rainfall != afterRainfall {
+								values := (math.Abs(rainfall-afterRainfall) * (float64(i+1) / float64(generateNum)))
+								rainfall = rainfall + values
+							}
+							if rainfall >= 0.1 {
+								gridcelldata = append(gridcelldata, Gridcelldata{Position: afterdata.(Gridcelldata).Position,
+									Color: pallet(rainfall), Elevation: rainfall})
+							}
+						} else if fmt.Sprintf("%v", reflect.TypeOf(beforedata)) == "main.Gridcelldata" &&
+							fmt.Sprintf("%v", reflect.TypeOf(afterdata)) != "main.Gridcelldata" {
+							rainfall := beforedata.(Gridcelldata).Elevation
+							afterRainfall := float64(0)
+							if rainfall != afterRainfall {
+								values := (math.Abs(rainfall-afterRainfall) * (float64(i+1) / float64(generateNum)))
+								rainfall = rainfall - values
+							}
+							if rainfall >= 0.1 {
+								gridcelldata = append(gridcelldata, Gridcelldata{Position: beforedata.(Gridcelldata).Position,
+									Color: pallet(rainfall), Elevation: rainfall})
+							}
+						}
 					}
+					operation = append(operation, Operation{Elapsedtime: beforeElapsedtime + (gapTime * (i + 1)), Gridcelldata: gridcelldata})
 				}
-				token[6] = lastToken
-				outx = ix
-
-				for ix < len(token)-1 {
-					token[ix-outx+7] = token[ix+1]
-					ix++
-				}
-			}
-
-			tm, err := time.Parse(dateFmt, token[0]) // RFC3339Nano
-			if err != nil {
-				log.Printf("Time parsing error with %s, %s : %v", token[0], dt, err)
-			}
-
-			if *jst { // we need to convert UTC to JST.
-				tm = tm.In(jstZone)
-			}
-
-			sDec, err2 := base64.StdEncoding.DecodeString(token[8])
-			if err2 != nil {
-				log.Printf("Decoding error with %s : %v", token[8], err)
-			}
-
-			if !started {
-				if (tm.Hour() > stHour || (tm.Hour() == stHour && tm.Minute() >= stMin)) &&
-					(tm.Hour() < edHour || (tm.Hour() == edHour && tm.Minute() <= edMin)) {
-					started = true
-					log.Printf("Start output! %v", tm)
-				} else {
-					continue // skip all data
-				}
-			} else {
-				if tm.Hour() > edHour || (tm.Hour() == edHour && tm.Minute() > edMin) {
-					started = false
-					log.Printf("Stop  output! %v", tm)
-					continue
-				}
-			}
-
-			if !started {
-				continue // skip following
-			}
-
-			{ // sending each packets
-				cont := pb.Content{Entity: sDec}
-				smo := sxutil.SupplyOpts{
-					Name:  token[5],
-					JSON:  token[6],
-					Cdata: &cont,
-				}
-
-				tsProto, _ := ptypes.TimestampProto(tm)
-
-				// if channel in channels
-				chnum, err := strconv.Atoi(token[4])
-				client, ok := clients[uint32(chnum)]
-				if ok && err == nil { // if there is channel
-					_, nerr := NotifySupplyWithTime(client, &smo, tsProto)
-					if nerr != nil {
-						log.Printf("Send Fail!%v", nerr)
-					}
-				}
-				if *speed < 0 { // sleep for each packet
-					time.Sleep(time.Duration(-*speed) * time.Millisecond)
-				}
-
-			}
-
-			dur := tm.Sub(last)
-
-			if dur.Nanoseconds() > 0 {
-				if *speed > 0 {
-					time.Sleep(time.Duration(float64(dur.Nanoseconds()) / *speed))
-				}
-				last = tm
-			}
-			if dur.Nanoseconds() < 0 {
-				last = tm
 			}
 		}
-
-		serr := scanner.Err()
-		if serr != nil {
-			log.Printf("Scanner error %v", serr)
-		}
-	*/
+		return operation
+	} else {
+		return operation
+	}
 }
 
 func sendAllStoredFile(clients map[uint32]*sxutil.SXServiceClient) {
@@ -519,9 +458,7 @@ func main() {
 	}
 
 	if sendfile != "" {
-		//		for { // infinite loop..
-		//sendingStoredFile(pcClients)
-		//		}
+
 	} else if *all { // send all file
 		sendAllStoredFile(pcClients)
 	} else if *dir != "" {
